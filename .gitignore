@@ -1,0 +1,8 @@
+# Ignore the project specification sheet
+project_specsheet (1).md
+
+.venv/
+.env
+.claude/
+__pycache__/
+*.pyc
