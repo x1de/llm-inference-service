@@ -6,3 +6,6 @@ project_specsheet (1).md
 .claude/
 __pycache__/
 *.pyc
+
+# Test script
+script.py
