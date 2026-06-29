@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from arq.connections import RedisSettings
+from arq import Retry
 
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GENAI_API_KEY"))
@@ -23,6 +24,7 @@ async def shutdown(ctx):
 
 async def process_job(ctx, job_id: str, text: str, task: str):
     db = ctx['db']
+    current_retry = ctx['job_try'] # Tracks the no. of retries for the current job. Starts at 1
     try:
         # client.aio exposes the async version of the Gemini client which is necessary to avoid blocking the event loop during LLM inference
         response = await client.aio.models.generate_content( # TODO: Change this to a streaming response to allow for real-time feedback to the user as the model generates content
@@ -37,14 +39,19 @@ async def process_job(ctx, job_id: str, text: str, task: str):
                         """,
                         response.text, 'completed', job_id) # Update the job status to completed and save the result in the database
     except Exception as e:
-        await db.execute("""
+        if current_retry < 4: # Retry the job up to 3 times in case of failure
+            backoff_delay = 2 ** current_retry # Exponential backoff strategy (e.g., 2s, 4s, 8s)
+            raise Retry(defer = backoff_delay) # Raise a JobRetry exception to signal the worker to retry the job
+        else:
+            await db.execute("""
                         UPDATE jobs SET status = $1, completed_at = NOW() WHERE id = $2
                         """,
-                        'failed', job_id) # Update the job status to failed in case of an error during processing
-        raise e
+                        'failed', job_id) # Update the job status to failed when max retries are exceeded
+            raise e # Re-raising the original error marks the job as 'failed' in Redis
 
 class WorkerSettings:
     functions = [process_job]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings()
+    max_tries = 4 # 1 initial attempt + 3 retries
