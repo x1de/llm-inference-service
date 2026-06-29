@@ -4,14 +4,20 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from arq import create_pool
+from arq.connections import RedisSettings
 
 load_dotenv()
 
 class JobRequest(BaseModel):
     text: str
     task: str
+
+class JobResponse(BaseModel):
+    id: str
+    user_id: str
+    result: str | None = None
+    status: str
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -24,34 +30,56 @@ async def lifespan(app: FastAPI):
         database=os.getenv("DB_NAME"),
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"))
+    app.state.redis_pool = await create_pool(RedisSettings()) # Arq redis pool manages connections to Redis specifically for job queuing
     yield
     await app.state.pool.close()
+    await app.state.redis_pool.close()
+app = FastAPI(lifespan=lifespan) # Database and redis are intialized at app startup and closed at shutdown
 
-app = FastAPI(lifespan=lifespan)
-client = genai.Client(api_key=os.getenv("GENAI_API_KEY"))
-
-async def get_db():
-    async with app.state.pool.acquire() as connection:
+async def get_db(): # Dependency to provide db connection to route handlers.
+    async with app.state.pool.acquire() as connection: 
         yield connection
 
+async def get_redis(): # Dependency to provide redis connection to route handlers.
+    yield app.state.redis_pool
+
 @app.post("/jobs")
-async def create_job(request: JobRequest, db: asyncpg.Connection = Depends(get_db)):
+async def create_job(request: JobRequest, db: asyncpg.Connection = Depends(get_db), redis = Depends(get_redis)) -> dict:
+    '''
+    Endpoint to create a new job. It accepts a JSON payload with 'text' and 'task' fields, inserts a new job into the database, 
+    and enqueues the job for processing in Redis.
+    Args:
+        request (JobRequest): The request body containing the text and task type.
+        db (asyncpg.Connection): The database connection, provided by the get_db dependency.
+        redis: The Redis connection, provided by the get_redis dependency.
+    Returns:
+        dict: A dictionary containing the result message and the job ID.
+    '''
     text = request.text     
-    task = request.task     
+    task = request.task      
     try:
-        # client.aio exposes the async version of the Gemini client which is necessary to avoid blocking the event loop during LLM inference
-        response = await client.aio.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=f"Perform the following task: {task} on the following text: {text}",  # Basic prompt to instruct the model's behavior
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)),  # Low thinking level as it is an analysis task
-        )
         job_id = await db.fetchval("""
-                        INSERT INTO jobs (user_id,input_text,task_type,result,status) 
-                        VALUES ('test-user', $1, $2, $3, $4)
+                        INSERT INTO jobs (user_id,input_text,task_type,status) 
+                        VALUES ('test-user', $1, $2, $3)
                         RETURNING id
                         """, 
-                        text, task, response.text, 'completed')
-        return {"result": f"{response.text}", "job_id": job_id}
+                        text, task, 'pending')
+        await redis.enqueue_job('process_job', job_id, text, task) # Enqueue the job for processing in Redis using the 'process_job' function defined in worker.py
+        return {"result": "Job created successfully", "job_id": job_id} # Return a success message along with the job ID to the client so that they don't have to wait for the job to complete and can check back later for the result.
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str, db: asyncpg.Connection = Depends(get_db)) -> JobResponse:
+    '''
+    Endpoint to retrieve the status and result of a job by its ID. It queries the database for the job details and returns them.
+    Args:
+        job_id (str): The ID of the job to retrieve.
+        db (asyncpg.Connection): The database connection, provided by the get_db dependency.
+    Returns:
+        JobResponse: An instance of the JobResponse Pydantic model containing the job details.
+    '''
+    job = await db.fetchrow("Select id, user_id, result, status from jobs where id = $1", job_id) 
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JobResponse(**dict(job))
