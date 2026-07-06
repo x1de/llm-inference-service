@@ -12,3 +12,16 @@ A multi-tenant document summarization service built on FastAPI, Redis, and Postg
 **Use of Pydantic**
 - Pydantic is used for input data validation & parsing. It enforces static type checking at runtime and can also be used to add specific constraints to input data so bad inputs are rejected at runtime. It also has automated graceful error handling.
 
+**Current Flow**
+Incoming Request -> Calls Gemini -> Saves result to DB -> Returns Result
+
+**Flow with Redis**
+
+Incoming Request -> Saves req to DB with status = pending -> Saves job_id in Redis Job Queue -> Returns job_id to Client
+
+Background: Arq Worker monitors Redis -> Fetches job from Redis -> Calls Gemini -> Saves result to DB with status=completed
+
+**Justification for Rate-limit Algorithm**
+- I used the Token Bucket algorithm over alternatives like sliding window because it's less memory-expensive. Sliding window requires storing exact timestamps for every request per user, whereas token bucket just stores two numbers (current tokens and last refill time) in a Redis hash. 
+- It also handles burst traffic naturally. If a user sends 5 requests at once, they're allowed up to bucket capacity before getting throttled, instead of being immediately rejected. This is important for a ticket processing service where support teams might submit a batch of tickets simultaneously. 
+- Widely used in production by Stripe, Gemini, and most major APIs.
