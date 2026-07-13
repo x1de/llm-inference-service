@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from arq import create_pool
 from arq.connections import RedisSettings
 from fastapi.security import APIKeyHeader
+import time
+import redis.asyncio as aioredis
 
 load_dotenv()
 
@@ -26,6 +28,35 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False) # Registers se
 # Paths that do not require API key authentication, such as registration and health check endpoints, as well as documentation endpoints.
 EXCLUDED_PATHS = {"/register", "/health", "/docs", "/openapi.json", "/redoc"} 
 
+RATE_LIMIT_SCRIPT = """
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
+local tokens = tonumber(bucket[1])
+local last_refill = tonumber(bucket[2])
+
+-- if bucket doesn't exist yet, initialize it
+if tokens == nil then
+    tokens = capacity
+    last_refill = now
+end
+
+-- refill the bucket based on the time elapsed since last refill
+local time_elapsed = now - last_refill
+tokens = math.min(capacity, tokens + time_elapsed * refill_rate)
+
+local allowed = 0
+if tokens >= 1 then
+    tokens = tokens - 1
+    allowed = 1
+end
+redis.call("HSET", key, "tokens", tokens, "last_refill", now)
+return allowed
+"""
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Connection pool ensures concurrent requests can be handled efficiently without the overhead of establishing a new connection for each request.
@@ -38,6 +69,7 @@ async def lifespan(app: FastAPI):
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"))
     app.state.redis_pool = await create_pool(RedisSettings()) # Arq redis pool manages connections to Redis specifically for job queuing
+    app.state.redis = aioredis.from_url("redis://localhost:6379") # Redis connection for rate limiting
     yield
     await app.state.pool.close()
     await app.state.redis_pool.close()
@@ -69,6 +101,14 @@ async def auth_middleware(request: Request, call_next):
             if not user:
                 return responses.JSONResponse(status_code=404, content={"detail": "User not found"})
             request.state.user = user
+        
+        # Rate limiting logic
+        user_id = str(request.state.user['id'])
+        rate_limit_key = f"rate_limit:{user_id}"
+        current_time = int(time.time())
+        allowed = await app.state.redis.eval(RATE_LIMIT_SCRIPT, 1, rate_limit_key, 5, 5/60, current_time)# 5 requests per second
+        if allowed == 0:
+            return responses.JSONResponse(status_code=429, content={"detail": "Rate limit exceeded. Please try again later."})
         
     # 1. Catches native asyncpg connection drops / handshake failures
     except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError) as e:
@@ -116,7 +156,7 @@ async def create_job(request: Request, body: JobRequest, db: asyncpg.Connection 
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(api_key_header)])
-async def get_job(job_id: str, db: asyncpg.Connection = Depends(get_db)) -> JobResponse:
+async def get_job(request: Request,job_id: str, db: asyncpg.Connection = Depends(get_db)) -> JobResponse:
     '''
     Endpoint to retrieve the status and result of a job by its ID. It queries the database for the job details and returns them.
     Args:
@@ -125,7 +165,8 @@ async def get_job(job_id: str, db: asyncpg.Connection = Depends(get_db)) -> JobR
     Returns:
         JobResponse: An instance of the JobResponse Pydantic model containing the job details.
     '''
-    job = await db.fetchrow("SELECT id, user_id, result, status, completed_at FROM jobs WHERE id = $1", job_id) 
+    user_id = str(request.state.user['id'])
+    job = await db.fetchrow("SELECT id, user_id, result, status FROM jobs WHERE id = $1 and user_id = $2", job_id, user_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     job_dict = dict(job)
