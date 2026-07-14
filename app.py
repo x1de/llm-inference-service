@@ -1,4 +1,5 @@
 import os
+import secrets
 import asyncpg
 import hashlib
 from contextlib import asynccontextmanager
@@ -23,10 +24,22 @@ class JobResponse(BaseModel):
     result: str | None = None
     status: str
 
+class JobCreateResponse(BaseModel):
+    result: str
+    job_id: str
+
+class RegisterRequest(BaseModel):
+    email: str
+
+class RegisterResponse(BaseModel):
+    api_key: str
+
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False) # Registers security scheme with OpenAPI spec for Swagger UI
 
 # Paths that do not require API key authentication, such as registration and health check endpoints, as well as documentation endpoints.
 EXCLUDED_PATHS = {"/register", "/health", "/docs", "/openapi.json", "/redoc"} 
+
+REFILL_RATE = 5 / 60  # 5 requests per minute
 
 RATE_LIMIT_SCRIPT = """
 local key = KEYS[1]
@@ -106,9 +119,14 @@ async def auth_middleware(request: Request, call_next):
         user_id = str(request.state.user['id'])
         rate_limit_key = f"rate_limit:{user_id}"
         current_time = int(time.time())
-        allowed = await app.state.redis.eval(RATE_LIMIT_SCRIPT, 1, rate_limit_key, 5, 5/60, current_time)# 5 requests per second
+        allowed = await app.state.redis.eval(RATE_LIMIT_SCRIPT, 1, rate_limit_key, 5, REFILL_RATE, current_time)
+
         if allowed == 0:
-            return responses.JSONResponse(status_code=429, content={"detail": "Rate limit exceeded. Please try again later."})
+            return responses.JSONResponse(
+                status_code=429, 
+                content={"detail": "Rate limit exceeded. Please try again later."},
+                headers={"Retry-After": f"{int(1/REFILL_RATE)}"} # Informs the client of the wait time before a request will be accepted.
+            ) 
         
     # 1. Catches native asyncpg connection drops / handshake failures
     except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError) as e:
@@ -128,7 +146,7 @@ async def auth_middleware(request: Request, call_next):
 
 
 @app.post("/jobs", dependencies=[Depends(api_key_header)])
-async def create_job(request: Request, body: JobRequest, db: asyncpg.Connection = Depends(get_db), redis = Depends(get_redis)) -> dict:
+async def create_job(request: Request, body: JobRequest, db: asyncpg.Connection = Depends(get_db), redis = Depends(get_redis)) -> JobCreateResponse:
     '''
     Endpoint to create a new job. It accepts a JSON payload with 'text' and 'task' fields, inserts a new job into the database, 
     and enqueues the job for processing in Redis.
@@ -138,7 +156,7 @@ async def create_job(request: Request, body: JobRequest, db: asyncpg.Connection 
         db (asyncpg.Connection): The database connection, provided by the get_db dependency.
         redis: The Redis connection, provided by the get_redis dependency.
     Returns:
-        dict: A dictionary containing the result message and the job ID.
+        JobCreateResponse: An instance of the JobCreateResponse Pydantic model containing the result message and the job ID.
     '''
     text = body.text     
     task = body.task
@@ -151,7 +169,7 @@ async def create_job(request: Request, body: JobRequest, db: asyncpg.Connection 
                         """, 
                         user_id,text, task, 'pending')
         await redis.enqueue_job('process_job', job_id, text, task) # Enqueue the job for processing in Redis using the 'process_job' function defined in worker.py
-        return {"result": "Job created successfully", "job_id": job_id} # Return a success message along with the job ID to the client so that they don't have to wait for the job to complete and can check back later for the result.
+        return JobCreateResponse(result="Job created successfully", job_id=str(job_id)) # Return a success message along with the job ID to the client so that they don't have to wait for the job to complete and can check back later for the result.
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -172,3 +190,25 @@ async def get_job(request: Request,job_id: str, db: asyncpg.Connection = Depends
     job_dict = dict(job)
     job_dict['id'] = str(job_dict['id'])
     return JobResponse(**job_dict)
+
+@app.post("/register")
+async def register_user(request: Request, body: RegisterRequest, db: asyncpg.Connection = Depends(get_db)) -> RegisterResponse:
+    '''
+    Endpoint to register a new user. It generates a unique API key for the user, hashes it, and stores it in the database.
+    Args:
+        request (Request): The incoming request object.
+        body (RegisterRequest): The request body containing the user's email.
+        db (asyncpg.Connection): The database connection, provided by the get_db dependency.
+    Returns:
+        RegisterResponse: An instance of the RegisterResponse Pydantic model containing the generated API key for the user.
+    '''
+    try:
+        user_email = body.email
+        api_key = secrets.token_hex(32)  # Generate a unique API key for the user
+        hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
+        await db.execute("INSERT INTO users (api_key, email) VALUES ($1, $2)", hashed_key, user_email)
+        return RegisterResponse(api_key=api_key) # Return the plain API key to the user so they can use it for authentication in future requests.
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=409, detail="Email already registered")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
