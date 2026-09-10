@@ -45,6 +45,15 @@ docker compose up --build
 
 This starts FastAPI, one arq worker, PostgreSQL, and Redis. Docker uses the local stub provider by default so testing does not consume Gemini quota. To run against Gemini outside Docker, copy `.env.example` to `.env`, add `GENAI_API_KEY`, and keep `LLM_PROVIDER=gemini`.
 
+## Load test
+
+```bash
+python -m pip install -r requirements-dev.txt
+locust --headless --users 20 --spawn-rate 5 --run-time 30s --host http://localhost:8000
+```
+
+Every simulated user receives a separate API key. This checks that concurrent tenants can queue and poll jobs independently while excess requests from one tenant receive HTTP 429 instead of reaching the worker. Benchmark numbers will be added only after a reproducible run.
+
 ## Why these choices
 
 **Async FastAPI:** Postgres, Redis, and Gemini calls spend most of their time waiting on network I/O. Async code lets the server work on another request during those waits.
@@ -59,4 +68,4 @@ Each response includes an `X-Request-ID` that also appears in the structured req
 
 ## Project status
 
-Layers 1-6 are complete: the synchronous API was converted to async, job processing moved to a queue, multi-tenant authentication and rate limiting were added, the service exposes basic health and usage information, and all four services are defined in Docker Compose. The remaining closeout task is concurrent load testing.
+Layers 1-6 and the Locust workload are implemented. The remaining closeout step is to run the Docker stack, record the load-test results, and update this README with measured latency and throughput.
