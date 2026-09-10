@@ -190,7 +190,7 @@ async def logging_middleware(request: Request, call_next):
     return response
 
 
-@app.post("/jobs", dependencies=[Depends(api_key_header)])
+@app.post("/jobs", dependencies=[Depends(api_key_header)], status_code=202)
 async def create_job(request: Request, body: JobRequest, db: asyncpg.Connection = Depends(get_db), redis = Depends(get_redis)) -> JobCreateResponse:
     '''
     Endpoint to create a new job. It accepts a JSON payload with 'text' and 'task' fields, inserts a new job into the database, 

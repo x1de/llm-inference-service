@@ -52,7 +52,25 @@ python -m pip install -r requirements-dev.txt
 locust --headless --users 20 --spawn-rate 5 --run-time 30s --host http://localhost:8000
 ```
 
-Every simulated user receives a separate API key. This checks that concurrent tenants can queue and poll jobs independently while excess requests from one tenant receive HTTP 429 instead of reaching the worker. Benchmark numbers will be added only after a reproducible run.
+Every simulated user receives a separate API key. This checks that concurrent tenants can queue and poll jobs independently while excess requests from one tenant receive HTTP 429 instead of reaching the worker.
+
+### Local results
+
+Measured on September 10, 2026 with 20 tenants, a spawn rate of 5 users/second, a 30-second run, and the 250 ms stub inference delay. The API and worker ran locally against PostgreSQL and Redis containers.
+
+| Measurement | Result |
+|---|---:|
+| Total requests | 1,094 |
+| Throughput | 36.76 requests/second |
+| Aggregate p50 latency | 10 ms |
+| Aggregate p95 latency | 26 ms |
+| Accepted jobs | 109 |
+| Rate-limited job submissions | 690 |
+| Completed / failed jobs | 109 / 0 |
+| Unexpected request failures | 0 |
+| Queue depth after the run | 0 |
+
+The test shows that the API continued serving requests, per-tenant limits rejected excess traffic, and the worker drained every accepted job during this run. It does not prove uptime under every workload.
 
 ## Why these choices
 
@@ -68,4 +86,4 @@ Each response includes an `X-Request-ID` that also appears in the structured req
 
 ## Project status
 
-Layers 1-6 and the Locust workload are implemented. The remaining closeout step is to run the Docker stack, record the load-test results, and update this README with measured latency and throughput.
+Layers 1-6 and the Locust workload are implemented and locally measured. Building and running the API and worker images through Compose remains a separate clean-environment verification step.

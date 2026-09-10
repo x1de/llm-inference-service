@@ -48,6 +48,7 @@ class TenantUser(HttpUser):
         with self.client.get(
             f"/jobs/{random.choice(self.job_ids)}",
             headers=self.headers,
+            name="/jobs/{job_id}",
             catch_response=True
         ) as response:
             if response.status_code == 429:
