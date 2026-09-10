@@ -2,7 +2,10 @@ import os
 import secrets
 import asyncpg
 import hashlib
+import json
+import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, Request, responses
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -13,6 +16,8 @@ import time
 import redis.asyncio as aioredis
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ticketiq")
 
 class JobRequest(BaseModel):
     text: str
@@ -23,6 +28,7 @@ class JobResponse(BaseModel):
     user_id: str
     result: str | None = None
     status: str
+    total_tokens: int | None = None
 
 class JobCreateResponse(BaseModel):
     result: str
@@ -33,6 +39,15 @@ class RegisterRequest(BaseModel):
 
 class RegisterResponse(BaseModel):
     api_key: str
+
+class MetricsResponse(BaseModel):
+    requests_today: int
+    jobs_submitted_today: int
+    jobs_completed_today: int
+    jobs_failed_today: int
+    average_processing_time_ms: float | None
+    total_tokens_today: int
+    queue_depth: int
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False) # Registers security scheme with OpenAPI spec for Swagger UI
 
@@ -86,6 +101,7 @@ async def lifespan(app: FastAPI):
     yield
     await app.state.pool.close()
     await app.state.redis_pool.close()
+    await app.state.redis.aclose()
 
 app = FastAPI(
     lifespan=lifespan,  # Database and redis are intialized at app startup and closed at shutdown
@@ -127,6 +143,12 @@ async def auth_middleware(request: Request, call_next):
                 content={"detail": "Rate limit exceeded. Please try again later."},
                 headers={"Retry-After": f"{int(1/REFILL_RATE)}"} # Informs the client of the wait time before a request will be accepted.
             ) 
+
+        # Tracks accepted requests per user for basic usage metering. The key expires after two days so Redis does not keep old daily counters forever.
+        usage_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        usage_key = f"usage:{user_id}:{usage_date}"
+        await app.state.redis.hincrby(usage_key, "requests", 1)
+        await app.state.redis.expire(usage_key, 172800)
         
     # 1. Catches native asyncpg connection drops / handshake failures
     except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError) as e:
@@ -142,6 +164,28 @@ async def auth_middleware(request: Request, call_next):
         return responses.JSONResponse(status_code=401, content={"detail": "Invalid API Key"})
     
     response = await call_next(request)
+    return response
+
+@app.middleware("http")
+async def logging_middleware(request: Request, call_next):
+    # Adds a request ID so one request can be followed across logs and returned errors.
+    request_id = request.headers.get("X-Request-ID", secrets.token_hex(8))
+    request.state.request_id = request_id
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    user = getattr(request.state, "user", None)
+
+    logger.info(json.dumps({
+        "event": "request_completed",
+        "request_id": request_id,
+        "user_id": str(user["id"]) if user else None,
+        "method": request.method,
+        "path": request.url.path,
+        "status_code": response.status_code,
+        "duration_ms": duration_ms
+    }))
+    response.headers["X-Request-ID"] = request_id
     return response
 
 
@@ -184,12 +228,58 @@ async def get_job(request: Request,job_id: str, db: asyncpg.Connection = Depends
         JobResponse: An instance of the JobResponse Pydantic model containing the job details.
     '''
     user_id = str(request.state.user['id'])
-    job = await db.fetchrow("SELECT id, user_id, result, status FROM jobs WHERE id = $1 and user_id = $2", job_id, user_id)
+    job = await db.fetchrow("SELECT id, user_id, result, status, total_tokens FROM jobs WHERE id = $1 and user_id = $2", job_id, user_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     job_dict = dict(job)
     job_dict['id'] = str(job_dict['id'])
     return JobResponse(**job_dict)
+
+@app.get("/health")
+async def health_check():
+    # Checks both dependencies separately so the response shows exactly which service is unavailable.
+    health = {"database": "up", "redis": "up"}
+    try:
+        async with app.state.pool.acquire() as connection:
+            await connection.fetchval("SELECT 1")
+    except Exception:
+        health["database"] = "down"
+
+    try:
+        await app.state.redis.ping()
+    except Exception:
+        health["redis"] = "down"
+
+    status_code = 200 if all(value == "up" for value in health.values()) else 503
+    return responses.JSONResponse(status_code=status_code, content=health)
+
+@app.get("/metrics", dependencies=[Depends(api_key_header)])
+async def get_metrics(request: Request, db: asyncpg.Connection = Depends(get_db)) -> MetricsResponse:
+    user_id = str(request.state.user['id'])
+    metrics = await db.fetchrow("""
+        SELECT
+            COUNT(*)::int AS jobs_submitted_today,
+            COUNT(*) FILTER (WHERE status = 'completed')::int AS jobs_completed_today,
+            COUNT(*) FILTER (WHERE status = 'failed')::int AS jobs_failed_today,
+            AVG(EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000)
+                FILTER (WHERE status = 'completed') AS average_processing_time_ms,
+            COALESCE(SUM(total_tokens), 0)::int AS total_tokens_today
+        FROM jobs
+        WHERE user_id = $1 AND created_at >= CURRENT_DATE
+    """, user_id)
+
+    usage_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    requests_today = await app.state.redis.hget(f"usage:{user_id}:{usage_date}", "requests")
+    metrics_dict = dict(metrics)
+    metrics_dict["average_processing_time_ms"] = (
+        round(float(metrics["average_processing_time_ms"]), 2)
+        if metrics["average_processing_time_ms"] is not None else None
+    )
+    return MetricsResponse(
+        requests_today=int(requests_today or 0),
+        **metrics_dict,
+        queue_depth=await app.state.redis.zcard("arq:queue")
+    )
 
 @app.post("/register")
 async def register_user(request: Request, body: RegisterRequest, db: asyncpg.Connection = Depends(get_db)) -> RegisterResponse:

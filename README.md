@@ -12,7 +12,7 @@ flowchart LR
     API -->|Queue job| Queue[(Redis queue)]
     Queue --> Worker[arq worker]
     Worker --> Gemini[Gemini API]
-    Worker -->|Save result and status| DB
+    Worker -->|Save result, status, and token usage| DB
     Client -->|Poll job ID| API
 ```
 
@@ -23,6 +23,7 @@ flowchart LR
 - `POST /jobs` stores a pending job, queues it, and immediately returns its ID.
 - The worker processes jobs asynchronously and retries failed LLM calls three times with exponential backoff.
 - A Redis token bucket limits each tenant independently and returns HTTP 429 when its bucket is empty.
+- Structured logs record request duration, request IDs, job state changes, and token usage.
 
 ## Endpoints
 
@@ -31,6 +32,8 @@ flowchart LR
 | `POST` | `/register` | Register an email and receive an API key |
 | `POST` | `/jobs` | Create and queue a ticket-processing job |
 | `GET` | `/jobs/{job_id}` | Poll a tenant-owned job for its status and result |
+| `GET` | `/health` | Check PostgreSQL and Redis connectivity |
+| `GET` | `/metrics` | Read the authenticated tenant's daily requests, jobs, latency, tokens, and queue depth |
 
 Protected endpoints require the `X-API-Key` header. Interactive API documentation is available at `/docs` while the service is running.
 
@@ -42,6 +45,10 @@ Protected endpoints require the `X-API-Key` header. Interactive API documentatio
 
 **Token bucket:** Each tenant stores only its token balance and last refill time. The Redis Lua script updates both values atomically and allows short bursts up to the bucket capacity.
 
+## Observability
+
+Each response includes an `X-Request-ID` that also appears in the structured request log. The worker logs when a job starts, completes, or exhausts its retries. Apply `migrations/001_observability.sql` before running this version so completed jobs can store their token counts.
+
 ## Project status
 
-Layers 1-4 are complete: the synchronous API was converted to async, job processing moved to a queue, and multi-tenant authentication and rate limiting were added. The next phase adds usage metering and basic observability without changing the overall structure.
+Layers 1-5 are complete: the synchronous API was converted to async, job processing moved to a queue, multi-tenant authentication and rate limiting were added, and the service now exposes basic health and usage information. The next phase packages the same API, worker, PostgreSQL, and Redis setup with Docker Compose.
