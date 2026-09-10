@@ -37,6 +37,14 @@ flowchart LR
 
 Protected endpoints require the `X-API-Key` header. Interactive API documentation is available at `/docs` while the service is running.
 
+## Run locally
+
+```bash
+docker compose up --build
+```
+
+This starts FastAPI, one arq worker, PostgreSQL, and Redis. Docker uses the local stub provider by default so testing does not consume Gemini quota. To run against Gemini outside Docker, copy `.env.example` to `.env`, add `GENAI_API_KEY`, and keep `LLM_PROVIDER=gemini`.
+
 ## Why these choices
 
 **Async FastAPI:** Postgres, Redis, and Gemini calls spend most of their time waiting on network I/O. Async code lets the server work on another request during those waits.
@@ -51,4 +59,4 @@ Each response includes an `X-Request-ID` that also appears in the structured req
 
 ## Project status
 
-Layers 1-5 are complete: the synchronous API was converted to async, job processing moved to a queue, multi-tenant authentication and rate limiting were added, and the service now exposes basic health and usage information. The next phase packages the same API, worker, PostgreSQL, and Redis setup with Docker Compose.
+Layers 1-6 are complete: the synchronous API was converted to async, job processing moved to a queue, multi-tenant authentication and rate limiting were added, the service exposes basic health and usage information, and all four services are defined in Docker Compose. The remaining closeout task is concurrent load testing.

@@ -18,6 +18,7 @@ import redis.asyncio as aioredis
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ticketiq")
+redis_host = os.getenv("REDIS_HOST", "localhost")
 
 class JobRequest(BaseModel):
     text: str
@@ -96,8 +97,8 @@ async def lifespan(app: FastAPI):
         database=os.getenv("DB_NAME"),
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"))
-    app.state.redis_pool = await create_pool(RedisSettings()) # Arq redis pool manages connections to Redis specifically for job queuing
-    app.state.redis = aioredis.from_url("redis://localhost:6379") # Redis connection for rate limiting
+    app.state.redis_pool = await create_pool(RedisSettings(host=redis_host)) # Arq redis pool manages connections to Redis specifically for job queuing
+    app.state.redis = aioredis.from_url(f"redis://{redis_host}:6379") # Redis connection for rate limiting
     yield
     await app.state.pool.close()
     await app.state.redis_pool.close()
