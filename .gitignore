@@ -9,3 +9,12 @@ __pycache__/
 
 # Test script
 script.py
+
+# Private interview notes (local only)
+INTERVIEW_NOTES.md
+
+# Local tooling output
+tmp/
+.pytest_cache/
+.ruff_cache/
+load-test-results/

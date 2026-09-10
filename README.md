@@ -1,27 +1,47 @@
-# LLM Inference Service
+# TicketIQ
 
-A multi-tenant document summarization service built on FastAPI, Redis, and PostgreSQL.
+TicketIQ is a multi-tenant API that queues customer-support ticket processing so clients do not wait for slow LLM responses.
 
-## Key design decisions
+## Architecture
 
-**Why async FastAPI over Django:**
-- FastAPI is async-native, whereas Django was primarily built with synchronicity in mind. Even though Django has added async support over time, it uses an ASGI handler wrapper which adds context switching overhead compared to FastAPI's native async implementation.
-- It has inbuilt OpenAPI. OpenAPI is used to describe how the application's REST API behaves. This includes listing existing endpoints, expected data format (headers, query params, and payload), status codes, etc. All of this is described in either JSON or YAML.
-- It also has out of the box SwaggerUI. SwaggerUI is used to generate a clean and interactive web page for the OpenAPI schema. It executes live API calls and lets you try endpoints directly through the webpage.
+```mermaid
+flowchart LR
+    Client[Client] -->|X-API-Key| API[FastAPI]
+    API -->|Check tenant limit| Limit[(Redis token bucket)]
+    API -->|Save pending job| DB[(PostgreSQL)]
+    API -->|Queue job| Queue[(Redis queue)]
+    Queue --> Worker[arq worker]
+    Worker --> Gemini[Gemini API]
+    Worker -->|Save result and status| DB
+    Client -->|Poll job ID| API
+```
 
-**Use of Pydantic**
-- Pydantic is used for input data validation & parsing. It enforces static type checking at runtime and can also be used to add specific constraints to input data so bad inputs are rejected at runtime. It also has automated graceful error handling.
+## Current behavior
 
-**Current Flow**
-Incoming Request -> Calls Gemini -> Saves result to DB -> Returns Result
+- API keys are generated during registration and stored as SHA-256 hashes.
+- Every job query is scoped to the authenticated user.
+- `POST /jobs` stores a pending job, queues it, and immediately returns its ID.
+- The worker processes jobs asynchronously and retries failed LLM calls three times with exponential backoff.
+- A Redis token bucket limits each tenant independently and returns HTTP 429 when its bucket is empty.
 
-**Flow with Redis**
+## Endpoints
 
-Incoming Request -> Saves req to DB with status = pending -> Saves job_id in Redis Job Queue -> Returns job_id to Client
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/register` | Register an email and receive an API key |
+| `POST` | `/jobs` | Create and queue a ticket-processing job |
+| `GET` | `/jobs/{job_id}` | Poll a tenant-owned job for its status and result |
 
-Background: Arq Worker monitors Redis -> Fetches job from Redis -> Calls Gemini -> Saves result to DB with status=completed
+Protected endpoints require the `X-API-Key` header. Interactive API documentation is available at `/docs` while the service is running.
 
-**Justification for Rate-limit Algorithm**
-- I used the Token Bucket algorithm over alternatives like sliding window because it's less memory-expensive. Sliding window requires storing exact timestamps for every request per user, whereas token bucket just stores two numbers (current tokens and last refill time) in a Redis hash. 
-- It also handles burst traffic naturally. If a user sends 5 requests at once, they're allowed up to bucket capacity before getting throttled, instead of being immediately rejected. This is important for a ticket processing service where support teams might submit a batch of tickets simultaneously. 
-- Widely used in production by Stripe, Gemini, and most major APIs.
+## Why these choices
+
+**Async FastAPI:** Postgres, Redis, and Gemini calls spend most of their time waiting on network I/O. Async code lets the server work on another request during those waits.
+
+**Redis and arq:** The queue separates quick request acceptance from slower LLM processing. It also gives retries and background workers a clear place in the architecture.
+
+**Token bucket:** Each tenant stores only its token balance and last refill time. The Redis Lua script updates both values atomically and allows short bursts up to the bucket capacity.
+
+## Project status
+
+Layers 1-4 are complete: the synchronous API was converted to async, job processing moved to a queue, and multi-tenant authentication and rate limiting were added. The next phase adds usage metering and basic observability without changing the overall structure.
