@@ -56,21 +56,16 @@ Every simulated user receives a separate API key. This checks that concurrent te
 
 ### Local results
 
-Measured on September 10, 2026 with 20 tenants, a spawn rate of 5 users/second, a 30-second run, and the 250 ms stub inference delay. The API and worker ran locally against PostgreSQL and Redis containers.
+Measured on September 10 and 13, 2026 with a 30-second run and the 250 ms stub inference delay. The API and worker ran locally against PostgreSQL and Redis containers. Each row is a separate run that starts with new tenants. The 20-, 50-, and 100-tenant tests spawned 5 users/second; the 1,000-tenant stress test spawned 50 users/second so that, like the 100-tenant test, it reached its target in 20 seconds.
 
-| Measurement | Result |
-|---|---:|
-| Total requests | 1,094 |
-| Throughput | 36.76 requests/second |
-| Aggregate p50 latency | 10 ms |
-| Aggregate p95 latency | 26 ms |
-| Accepted jobs | 109 |
-| Rate-limited job submissions | 690 |
-| Completed / failed jobs | 109 / 0 |
-| Unexpected request failures | 0 |
-| Queue depth after the run | 0 |
+| Tenants | Total requests | Requests/second | Aggregate p50 | Aggregate p95 | Accepted jobs | Rate-limited submissions | Completed / failed | Unexpected failures | Final queue depth |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20 | 1,094 | 36.76 | 10 ms | 26 ms | 109 | 690 | 109 / 0 | 0 | 0 |
+| 50 | 2,203 | 75.38 | 11 ms | 37 ms | 244 | 1,394 | 244 / 0 | 0 | 0 |
+| 100 | 3,441 | 117.92 | 13 ms | 110 ms | 463 | 2,041 | 463 / 0 | 0 | 0 |
+| 1,000 | 5,976 | 204.40 | 2,200 ms | 5,400 ms | 3,116 | 891 | 3,116 / 0 | 0 | 0 |
 
-The test shows that the API continued serving requests, per-tenant limits rejected excess traffic, and the worker drained every accepted job during this run. It does not prove uptime under every workload.
+The tests show that the API continued serving requests as concurrent tenants increased, per-tenant limits rejected excess submissions, and the worker drained every accepted job after each run. At 1,000 tenants, aggregate p95 latency rose to 5.4 seconds and the queue contained 2,286 jobs when traffic stopped; the final job completed about 2 minutes 15 seconds later. This indicates local saturation rather than a successful 1,000-user production capacity target. The request rate includes fast, expected HTTP 429 responses, so it should not be interpreted as LLM job-processing throughput. These short local runs do not prove production capacity or uptime under every workload.
 
 ## Why these choices
 
@@ -83,7 +78,3 @@ The test shows that the API continued serving requests, per-tenant limits reject
 ## Observability
 
 Each response includes an `X-Request-ID` that also appears in the structured request log. The worker logs when a job starts, completes, or exhausts its retries. Apply `migrations/001_observability.sql` before running this version so completed jobs can store their token counts.
-
-## Project status
-
-Layers 1-6 and the Locust workload are implemented and locally measured. Building and running the API and worker images through Compose remains a separate clean-environment verification step.
